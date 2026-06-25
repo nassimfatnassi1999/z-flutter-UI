@@ -90,11 +90,9 @@ class NativeMailProvider implements MailProvider {
   }
 
   Uri _mailtoUri(String? recipientEmail, String subject, String body) {
-    return Uri(
-      scheme: 'mailto',
-      path: recipientEmail?.trim() ?? '',
-      queryParameters: _composerParams(subject: subject, body: body),
-    );
+    final query = _composerQuery(subject: subject, body: body);
+    final recipient = Uri.encodeComponent(recipientEmail?.trim() ?? '');
+    return Uri.parse('mailto:$recipient${query.isEmpty ? '' : '?$query'}');
   }
 
   Uri? _preferredUri(
@@ -105,27 +103,62 @@ class NativeMailProvider implements MailProvider {
   }) {
     final to = recipientEmail?.trim() ?? '';
     return switch (preferredAppCode) {
-      'gmail' => Uri(
-        scheme: 'googlegmail',
-        host: 'co',
-        queryParameters: _composerParams(to: to, subject: subject, body: body),
+      'gmail' => _appComposerUri(
+        'googlegmail://co',
+        to: to,
+        subject: subject,
+        body: body,
       ),
-      'outlook' => Uri(
-        scheme: 'ms-outlook',
-        host: 'compose',
-        queryParameters: _composerParams(to: to, subject: subject, body: body),
+      'outlook' => _appComposerUri(
+        'ms-outlook://compose',
+        to: to,
+        subject: subject,
+        body: body,
       ),
       _ => null,
     };
   }
 
-  Map<String, String> _composerParams({
+  Uri _appComposerUri(
+    String base, {
     String? to,
     required String subject,
     required String body,
   }) {
-    return {?to: to, 'subject': subject, 'body': body};
+    final query = _composerQuery(to: to, subject: subject, body: body);
+    return Uri.parse('$base${query.isEmpty ? '' : '?$query'}');
   }
+
+  String _composerQuery({
+    String? to,
+    required String subject,
+    required String body,
+  }) {
+    return [
+      if (to != null && to.trim().isNotEmpty)
+        'to=${_encodeMailtoComponent(to.trim())}',
+      if (subject.trim().isNotEmpty)
+        'subject=${_encodeMailtoComponent(subject.trim())}',
+      if (body.trim().isNotEmpty) 'body=${_encodeMailtoComponent(body)}',
+    ].join('&');
+  }
+
+  @visibleForTesting
+  Uri buildMailtoUri(String? recipientEmail, String subject, String body) =>
+      _mailtoUri(recipientEmail, subject, body);
+
+  @visibleForTesting
+  Uri? buildPreferredUri(
+    String preferredAppCode, {
+    required String? recipientEmail,
+    required String subject,
+    required String body,
+  }) => _preferredUri(
+    preferredAppCode,
+    recipientEmail: recipientEmail,
+    subject: subject,
+    body: body,
+  );
 
   Future<bool> _tryLaunch(Uri uri) async {
     final canLaunch = await canLaunchUrl(uri);
@@ -142,4 +175,8 @@ class NativeMailProvider implements MailProvider {
   void _debugLog(String message) {
     if (kDebugMode) debugPrint(message);
   }
+}
+
+String _encodeMailtoComponent(String value) {
+  return Uri.encodeComponent(value).replaceAll('+', '%20');
 }

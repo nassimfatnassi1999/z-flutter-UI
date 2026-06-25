@@ -186,6 +186,7 @@ class AppSession extends ChangeNotifier {
   String transcript = '';
   String tone = EmailTone.professional.apiValue;
   SpeechLanguage transcriptionLanguage = SpeechLanguage.auto;
+  String lastDetectedSpeechLanguage = 'unknown';
   PreferredMailApp preferredMailApp = PreferredMailApp.system;
   GeneratedEmail? generatedEmail;
   final List<EmailDraft> history = [];
@@ -222,6 +223,11 @@ class AppSession extends ChangeNotifier {
 
   void setTranscript(String value) {
     transcript = value;
+    notifyListeners();
+  }
+
+  void setLastDetectedSpeechLanguage(String value) {
+    lastDetectedSpeechLanguage = value.trim().isEmpty ? 'unknown' : value;
     notifyListeners();
   }
 
@@ -684,7 +690,7 @@ enum SpeechLanguage {
   fr('fr', 'Français'),
   en('en', 'English'),
   ar('ar', 'العربية'),
-  mixed('mixed', 'Français + English');
+  mixed('fr-en', 'Français + English');
 
   const SpeechLanguage(this.code, this.label);
 
@@ -702,6 +708,7 @@ enum SpeechLanguage {
   }
 
   static SpeechLanguage fromCode(String code) {
+    if (code == 'mixed') return SpeechLanguage.mixed;
     return values.firstWhere(
       (language) => language.code == code,
       orElse: () => SpeechLanguage.auto,
@@ -1339,6 +1346,7 @@ class _VoiceRecordScreenState extends State<VoiceRecordScreen>
 
       final transcript = result.transcript.trim();
       session.setTranscript(transcript);
+      session.setLastDetectedSpeechLanguage(result.language);
       _manualTranscript.text = transcript;
       _manualTranscript.selection = TextSelection.collapsed(
         offset: transcript.length,
@@ -1829,7 +1837,8 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final email = ZScope.of(context).session.generatedEmail;
+    final session = ZScope.of(context).session;
+    final email = session.generatedEmail;
     return FlowShell(
       title: 'Prévisualisation',
       step: '2/2',
@@ -1841,7 +1850,11 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
             children: [
               InfoPill(
                 icon: Icons.language_rounded,
-                label: _languageLabel(email?.language ?? ''),
+                label: _languageLabel(
+                  session.lastDetectedSpeechLanguage != 'unknown'
+                      ? session.lastDetectedSpeechLanguage
+                      : email?.language ?? '',
+                ),
               ),
               InfoPill(
                 icon: Icons.psychology_alt_outlined,
@@ -1931,11 +1944,13 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
 
   String _languageLabel(String language) {
     final normalized = language.toLowerCase();
-    if (normalized.startsWith('fr')) return 'Français détecté';
-    if (normalized.startsWith('en')) return 'English detected';
-    if (normalized.startsWith('ar')) return 'العربية detected';
-    if (normalized.contains('mixed')) return 'Français + English';
-    return 'Langue détectée';
+    if (normalized.contains('mixed') || normalized.contains('fr-en')) {
+      return 'Language detected: Français / English';
+    }
+    if (normalized.startsWith('fr')) return 'Language detected: Français';
+    if (normalized.startsWith('en')) return 'Language detected: English';
+    if (normalized.startsWith('ar')) return 'Language detected: العربية';
+    return 'Language detected: Unknown';
   }
 }
 
