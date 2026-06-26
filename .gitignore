@@ -1,125 +1,76 @@
-# ==========================================
-# Flutter / Dart
-# ==========================================
-.dart_tool/
-.flutter-plugins
-.flutter-plugins-dependencies
-.packages
-.pub/
-.pub-cache/
-.pubspec.lock
-
-# ==========================================
-# Build
-# ==========================================
-build/
-coverage/
-
-# ==========================================
-# Generated
-# ==========================================
-generated/
-*.g.dart
-*.freezed.dart
-
-# ==========================================
-# Android
-# ==========================================
-android/.gradle/
-android/app/debug/
-android/app/profile/
-android/app/release/
-android/local.properties
-android/key.properties
-android/**/captures/
-android/.idea/
-
-# Keystore
-*.jks
-*.keystore
-
-# ==========================================
-# iOS
-# ==========================================
-ios/Flutter/.last_build_id
-ios/Flutter/App.framework
-ios/Flutter/Flutter.framework
-ios/Flutter/Flutter.podspec
-ios/Flutter/Generated.xcconfig
-ios/Flutter/flutter_export_environment.sh
-
-ios/Pods/
-ios/.symlinks/
-
-# Xcode
-ios/Runner.xcworkspace/
-ios/xcuserdata/
-ios/**/*.xcuserstate
-
-# ==========================================
-# macOS
-# ==========================================
-macos/Pods/
-macos/Flutter/ephemeral/
-
-# ==========================================
-# Linux
-# ==========================================
-linux/flutter/ephemeral/
-
-# ==========================================
-# Windows
-# ==========================================
-windows/flutter/ephemeral/
-
-# ==========================================
-# Web
-# ==========================================
-web/.dart_tool/
-
-# ==========================================
-# Environment
-# ==========================================
-.env
-.env.*
-!.env.example
-
-# ==========================================
-# Logs
-# ==========================================
+# Miscellaneous
+*.class
 *.log
-
-# ==========================================
-# IDE
-# ==========================================
-.idea/
-.vscode/
-*.iml
-
-# ==========================================
-# OS
-# ==========================================
+*.pyc
+*.swp
 .DS_Store
-Thumbs.db
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
 
-# ==========================================
-# Firebase
-# ==========================================
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Secrets & local environment — never commit
+*.env
+.env*
+!.env.example
+secrets.dart
+lib/**/secrets.dart
+
+# Firebase config (generated / contains project keys)
+google-services.json
+GoogleService-Info.plist
+firebase_options.dart
+.firebase/
 firebase-debug.log
 
-# ==========================================
-# Crashlytics
-# ==========================================
-crashlytics-build.properties
+# Android signing
+*.jks
+*.keystore
+key.properties
+android/local.properties
 
-# ==========================================
-# Fastlane
-# ==========================================
-fastlane/report.xml
-fastlane/Preview.html
-fastlane/screenshots/
+# iOS / macOS
+ios/Flutter/flutter_export_environment.sh
+**/ios/ServiceDefinitions.json
+**/xcuserdata/
+Podfile.lock
 
-# ==========================================
-# Misc
-# ==========================================
-*.lock
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp

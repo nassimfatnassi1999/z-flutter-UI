@@ -7,6 +7,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -28,11 +29,13 @@ class AppRoutes {
   static const onboarding = '/onboarding';
   static const login = '/login';
   static const register = '/register';
+  static const verifyEmail = '/verify-email';
   static const home = '/home';
   static const voiceRecord = '/voice-record';
   static const emailPreview = '/email-preview';
   static const history = '/history';
   static const settings = '/settings';
+  static const profile = '/profile';
 }
 
 class ZApp extends StatefulWidget {
@@ -51,8 +54,8 @@ class _ZAppState extends State<ZApp> {
   @override
   void initState() {
     super.initState();
-    _api = ZApi(widget.config);
-    unawaited(_session.loadSettings());
+    _api = ZApi(widget.config, _session);
+    unawaited(_session.initialize(_api));
   }
 
   @override
@@ -60,19 +63,41 @@ class _ZAppState extends State<ZApp> {
     return ZScope(
       api: _api,
       session: _session,
-      child: MaterialApp(
-        title: 'Z',
-        debugShowCheckedModeBanner: false,
-        theme: ZTheme.light,
-        initialRoute: AppRoutes.splash,
-        onGenerateRoute: _route,
+      child: AnimatedBuilder(
+        animation: _session,
+        builder: (context, _) {
+          return MaterialApp(
+            title: 'Z',
+            debugShowCheckedModeBanner: false,
+            theme: ZTheme.light(_session.accentColor.color),
+            darkTheme: ZTheme.dark(_session.accentColor.color),
+            themeMode: _session.themeMode,
+            initialRoute: AppRoutes.splash,
+            onGenerateRoute: _route,
+          );
+        },
       ),
     );
   }
 
   Route<void> _route(RouteSettings settings) {
+    final name = settings.name ?? AppRoutes.splash;
+    if (_isProtectedRoute(name) && !_session.isAuthenticated) {
+      return MaterialPageRoute(
+        settings: const RouteSettings(name: AppRoutes.login),
+        builder: (_) => const LoginScreen(),
+      );
+    }
+    if (_session.isAuthenticated &&
+        (name == AppRoutes.login || name == AppRoutes.register)) {
+      return MaterialPageRoute(
+        settings: const RouteSettings(name: AppRoutes.home),
+        builder: (_) => const HomeScreen(),
+      );
+    }
+
     Widget page;
-    switch (settings.name) {
+    switch (name) {
       case AppRoutes.splash:
         page = const SplashScreen();
       case AppRoutes.onboarding:
@@ -81,6 +106,9 @@ class _ZAppState extends State<ZApp> {
         page = const LoginScreen();
       case AppRoutes.register:
         page = const RegisterScreen();
+      case AppRoutes.verifyEmail:
+        final email = settings.arguments as String?;
+        page = VerifyEmailScreen(email: email ?? '');
       case AppRoutes.home:
         page = const HomeScreen();
       case AppRoutes.voiceRecord:
@@ -92,10 +120,25 @@ class _ZAppState extends State<ZApp> {
         page = const HistoryScreen();
       case AppRoutes.settings:
         page = const SettingsScreen();
+      case AppRoutes.profile:
+        page = const ProfileScreen();
       default:
-        page = const SplashScreen();
+        page = _session.isAuthenticated
+            ? const HomeScreen()
+            : const LoginScreen();
     }
     return MaterialPageRoute(settings: settings, builder: (_) => page);
+  }
+
+  bool _isProtectedRoute(String name) {
+    return {
+      AppRoutes.home,
+      AppRoutes.voiceRecord,
+      AppRoutes.emailPreview,
+      AppRoutes.history,
+      AppRoutes.settings,
+      AppRoutes.profile,
+    }.contains(name);
   }
 }
 
@@ -108,14 +151,17 @@ class ZTheme {
   static const canvas = Color(0xFFF8F6F2);
   static const card = Colors.white;
 
-  static ThemeData get light {
+  static Color accentOf(BuildContext context) =>
+      Theme.of(context).colorScheme.primary;
+
+  static ThemeData light(Color accent) {
     final scheme = ColorScheme.fromSeed(
-      seedColor: blue,
+      seedColor: accent,
       brightness: Brightness.light,
     );
     return ThemeData(
       colorScheme: scheme.copyWith(
-        primary: blue,
+        primary: accent,
         surface: canvas,
         onSurface: ink,
       ),
@@ -129,7 +175,7 @@ class ZTheme {
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          backgroundColor: blue,
+          backgroundColor: accent,
           foregroundColor: Colors.white,
           minimumSize: const Size.fromHeight(54),
           shape: RoundedRectangleBorder(
@@ -148,6 +194,37 @@ class ZTheme {
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
           borderSide: const BorderSide(color: Color(0xFFE5E2DC)),
+        ),
+      ),
+    );
+  }
+
+  static ThemeData dark(Color accent) {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: accent,
+      brightness: Brightness.dark,
+    );
+    return ThemeData(
+      colorScheme: scheme.copyWith(primary: accent),
+      scaffoldBackgroundColor: const Color(0xFF101114),
+      useMaterial3: true,
+      appBarTheme: const AppBarTheme(elevation: 0, centerTitle: false),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          backgroundColor: accent,
+          foregroundColor: Colors.white,
+          minimumSize: const Size.fromHeight(54),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
         ),
       ),
     );
@@ -177,15 +254,35 @@ class ZScope extends InheritedWidget {
 }
 
 class AppSession extends ChangeNotifier {
+  static const _secureStorage = FlutterSecureStorage();
+  static const _deviceIdKey = 'z.deviceId';
+  static const _onboardingCompleteKey = 'z.onboardingComplete';
+  static const _themeModeKey = 'z.themeMode';
+  static const _accentColorKey = 'z.accentColor';
   static const _languagePreferenceKey = 'z.transcriptionLanguage';
+  static const _emailLanguagePreferenceKey = 'z.emailOutputLanguage';
   static const _mailPreferenceKey = 'z.preferredMailApp';
+  static const _historyKey = 'z.localHistory';
+  static const _accessTokenKey = 'z.auth.accessToken';
+  static const _refreshTokenKey = 'z.auth.refreshToken';
+  static const _userProfileKey = 'z.auth.user';
 
   String? accessToken;
+  String? refreshToken;
   UserProfile? user;
+  String deviceId = '';
+  bool onboardingComplete = false;
+  bool startupChecked = false;
+  bool startupChecking = true;
+  String? startupError;
+  bool offlineHistory = false;
+  ThemeMode themeMode = ThemeMode.system;
+  ZAccentColor accentColor = ZAccentColor.blue;
   String selectedTemplate = 'Autre';
   String transcript = '';
   String tone = EmailTone.professional.apiValue;
   SpeechLanguage transcriptionLanguage = SpeechLanguage.auto;
+  SpeechLanguage emailOutputLanguage = SpeechLanguage.auto;
   String lastDetectedSpeechLanguage = 'unknown';
   PreferredMailApp preferredMailApp = PreferredMailApp.system;
   GeneratedEmail? generatedEmail;
@@ -193,27 +290,164 @@ class AppSession extends ChangeNotifier {
 
   bool get isAuthenticated => accessToken != null;
 
+  Future<void> initialize(ZApi api) async {
+    await loadSettings();
+    await restoreSession(api);
+  }
+
   Future<void> loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    deviceId = prefs.getString(_deviceIdKey) ?? _newDeviceId();
+    await prefs.setString(_deviceIdKey, deviceId);
+    onboardingComplete = prefs.getBool(_onboardingCompleteKey) ?? false;
+    themeMode = _themeModeFromName(
+      prefs.getString(_themeModeKey) ?? ThemeMode.system.name,
+    );
+    accentColor = ZAccentColor.fromCode(
+      prefs.getString(_accentColorKey) ?? ZAccentColor.blue.code,
+    );
     transcriptionLanguage = SpeechLanguage.fromCode(
       prefs.getString(_languagePreferenceKey) ?? SpeechLanguage.auto.code,
+    );
+    emailOutputLanguage = SpeechLanguage.fromCode(
+      prefs.getString(_emailLanguagePreferenceKey) ?? SpeechLanguage.auto.code,
     );
     preferredMailApp = PreferredMailApp.fromCode(
       prefs.getString(_mailPreferenceKey) ?? PreferredMailApp.system.code,
     );
+    history
+      ..clear()
+      ..addAll(_decodeHistory(prefs.getString(_historyKey)));
     notifyListeners();
   }
 
-  void authenticate(AuthResult result) {
+  Future<void> restoreSession(ZApi api) async {
+    startupChecking = true;
+    startupError = null;
+    notifyListeners();
+    try {
+      accessToken = await _secureStorage.read(key: _accessTokenKey);
+      refreshToken = await _secureStorage.read(key: _refreshTokenKey);
+      final cachedUser = await _secureStorage.read(key: _userProfileKey);
+      if (cachedUser != null) {
+        user = UserProfile.fromJson(
+          (jsonDecode(cachedUser) as Map).cast<String, dynamic>(),
+        );
+      }
+
+      if (accessToken != null) {
+        try {
+          user = await api.fetchMe(token: accessToken!);
+          await _persistAuth();
+          await refreshHistory(api);
+          return;
+        } catch (_) {
+          if (refreshToken == null) rethrow;
+        }
+      }
+
+      if (refreshToken != null) {
+        final result = await api.refreshAuth(refreshToken: refreshToken!);
+        await authenticate(result, api: api);
+      }
+    } catch (error) {
+      await clearAuth();
+      startupError = 'Session expirée. Connectez-vous à nouveau.';
+    } finally {
+      startupChecking = false;
+      startupChecked = true;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> refreshFromApi(ZApi api) async {
+    final token = refreshToken;
+    if (token == null) return false;
+    try {
+      final result = await api.refreshAuth(refreshToken: token);
+      accessToken = result.accessToken;
+      refreshToken = result.refreshToken;
+      user = result.user;
+      await _persistAuth();
+      notifyListeners();
+      return true;
+    } catch (_) {
+      await clearAuth();
+      return false;
+    }
+  }
+
+  Future<void> completeOnboarding() async {
+    onboardingComplete = true;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_onboardingCompleteKey, true);
+  }
+
+  Future<void> authenticate(AuthResult result, {ZApi? api}) async {
     accessToken = result.accessToken;
+    refreshToken = result.refreshToken;
     user = result.user;
+    await _persistAuth();
+    if (api != null) {
+      await refreshHistory(api);
+    }
     notifyListeners();
   }
 
-  void logout() {
+  Future<void> clearAuth() async {
     accessToken = null;
+    refreshToken = null;
     user = null;
+    await _secureStorage.delete(key: _accessTokenKey);
+    await _secureStorage.delete(key: _refreshTokenKey);
+    await _secureStorage.delete(key: _userProfileKey);
     notifyListeners();
+  }
+
+  Future<void> logout(ZApi api) async {
+    final token = accessToken;
+    if (token != null) {
+      try {
+        await api.logoutAuth(token: token);
+      } catch (_) {}
+    }
+    await clearAuth();
+  }
+
+  Future<void> updateUser(UserProfile value) async {
+    user = value;
+    await _persistAuth();
+    notifyListeners();
+  }
+
+  Future<void> refreshHistory(ZApi api) async {
+    if (!isAuthenticated) return;
+    try {
+      final drafts = await api.listDrafts(
+        token: accessToken,
+        deviceId: deviceId,
+      );
+      history
+        ..clear()
+        ..addAll(drafts);
+      offlineHistory = false;
+      _persistHistory();
+    } catch (_) {
+      offlineHistory = true;
+    }
+    notifyListeners();
+  }
+
+  void markOfflineHistory() {
+    offlineHistory = true;
+    notifyListeners();
+  }
+
+  Future<void> claimDeviceDrafts(ZApi api) async {
+    if (!isAuthenticated) return;
+    await api.claimDeviceDrafts(token: accessToken!, deviceId: deviceId);
+    await refreshHistory(api);
   }
 
   void setTemplate(String template) {
@@ -231,6 +465,18 @@ class AppSession extends ChangeNotifier {
     notifyListeners();
   }
 
+  String get outputLanguageForGeneration => emailOutputLanguage.code;
+
+  String get transcriptLanguageForGeneration {
+    if (lastDetectedSpeechLanguage != 'unknown') {
+      return lastDetectedSpeechLanguage;
+    }
+    if (transcriptionLanguage != SpeechLanguage.auto) {
+      return transcriptionLanguage.code;
+    }
+    return 'unknown';
+  }
+
   void setTone(String value) {
     tone = value;
     notifyListeners();
@@ -242,12 +488,42 @@ class AppSession extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setThemeMode(ThemeMode value) {
+    themeMode = value;
+    notifyListeners();
+    unawaited(
+      SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString(_themeModeKey, value.name),
+      ),
+    );
+  }
+
+  void setAccentColor(ZAccentColor value) {
+    accentColor = value;
+    notifyListeners();
+    unawaited(
+      SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString(_accentColorKey, value.code),
+      ),
+    );
+  }
+
   void setTranscriptionLanguage(SpeechLanguage value) {
     transcriptionLanguage = value;
     notifyListeners();
     unawaited(
       SharedPreferences.getInstance().then(
         (prefs) => prefs.setString(_languagePreferenceKey, value.code),
+      ),
+    );
+  }
+
+  void setEmailOutputLanguage(SpeechLanguage value) {
+    emailOutputLanguage = value;
+    notifyListeners();
+    unawaited(
+      SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString(_emailLanguagePreferenceKey, value.code),
       ),
     );
   }
@@ -269,6 +545,7 @@ class AppSession extends ChangeNotifier {
 
   void addDraft(EmailDraft draft) {
     history.insert(0, draft);
+    _persistHistory();
     notifyListeners();
   }
 
@@ -276,6 +553,7 @@ class AppSession extends ChangeNotifier {
     final index = history.indexWhere((draft) => draft.id == id);
     if (index == -1) return;
     history[index] = history[index].copyWith(status: EmailDraftStatus.deleted);
+    _persistHistory();
     notifyListeners();
   }
 
@@ -283,6 +561,7 @@ class AppSession extends ChangeNotifier {
     final index = history.indexWhere((draft) => draft.id == id);
     if (index == -1) return;
     history[index] = history[index].copyWith(status: status);
+    _persistHistory();
     notifyListeners();
   }
 
@@ -295,6 +574,7 @@ class AppSession extends ChangeNotifier {
         createdAt: DateTime.now(),
       ),
     );
+    _persistHistory();
     notifyListeners();
   }
 
@@ -321,20 +601,73 @@ class AppSession extends ChangeNotifier {
         }
       }
     }
+    _persistHistory();
     notifyListeners();
+  }
+
+  String _newDeviceId() {
+    return 'device-${DateTime.now().microsecondsSinceEpoch}-${math.Random().nextInt(999999)}';
+  }
+
+  ThemeMode _themeModeFromName(String name) {
+    return ThemeMode.values.firstWhere(
+      (mode) => mode.name == name,
+      orElse: () => ThemeMode.system,
+    );
+  }
+
+  List<EmailDraft> _decodeHistory(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return [];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return [];
+      return decoded
+          .whereType<Map>()
+          .map((item) => EmailDraft.fromJson(item.cast<String, dynamic>()))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  void _persistHistory() {
+    final encoded = jsonEncode(
+      history.take(50).map((draft) => draft.toJson()).toList(),
+    );
+    unawaited(
+      SharedPreferences.getInstance().then(
+        (prefs) => prefs.setString(_historyKey, encoded),
+      ),
+    );
+  }
+
+  Future<void> _persistAuth() async {
+    if (accessToken != null) {
+      await _secureStorage.write(key: _accessTokenKey, value: accessToken);
+    }
+    if (refreshToken != null) {
+      await _secureStorage.write(key: _refreshTokenKey, value: refreshToken);
+    }
+    if (user != null) {
+      await _secureStorage.write(
+        key: _userProfileKey,
+        value: jsonEncode(user!.toJson()),
+      );
+    }
   }
 }
 
 class ZApi {
-  const ZApi(this.config);
+  const ZApi(this.config, this.session);
 
   static const _connectTimeout = Duration(seconds: 10);
   static const _sendTimeout = Duration(seconds: 20);
   static const _receiveTimeout = Duration(seconds: 20);
 
   final AppConfig config;
+  final AppSession session;
 
-  Future<AuthResult> register({
+  Future<RegisterResult> register({
     required String email,
     required String name,
     required String password,
@@ -346,7 +679,7 @@ class ZApi {
       'name': name,
       'password': password,
     });
-    return AuthResult.fromJson(json);
+    return RegisterResult.fromJson(json);
   }
 
   Future<AuthResult> login({
@@ -362,13 +695,82 @@ class ZApi {
     return AuthResult.fromJson(json);
   }
 
+  Future<AuthResult> verifyEmail({
+    required String email,
+    required String code,
+  }) async {
+    final json = await _post('auth/verify-email', {
+      'email': email,
+      'code': code,
+    });
+    return AuthResult.fromJson(json);
+  }
+
+  Future<void> resendVerificationCode({required String email}) async {
+    await _post('auth/resend-verification-code', {'email': email});
+  }
+
+  Future<AuthResult> refreshAuth({required String refreshToken}) async {
+    final json = await _post('auth/refresh', {'refreshToken': refreshToken});
+    return AuthResult.fromJson(json);
+  }
+
+  Future<void> logoutAuth({required String token}) async {
+    await _post('auth/logout', {}, token: token);
+  }
+
+  Future<UserProfile> fetchMe({required String token}) async {
+    final json = await _get('users/me', token: token);
+    return UserProfile.fromJson(json);
+  }
+
+  Future<UserProfile> updateMe({
+    required String token,
+    required String name,
+  }) async {
+    final json = await _patch('users/me', {'name': name}, token: token);
+    return UserProfile.fromJson(json);
+  }
+
+  Future<List<EmailDraft>> listDrafts({
+    String? token,
+    required String deviceId,
+  }) async {
+    final json = await _get('drafts', token: token, deviceId: deviceId);
+    final items = json['items'] as List? ?? json['drafts'] as List? ?? [];
+    return items
+        .whereType<Map>()
+        .map((item) => EmailDraft.fromJson(item.cast<String, dynamic>()))
+        .toList();
+  }
+
+  Future<void> claimDeviceDrafts({
+    required String token,
+    required String deviceId,
+  }) async {
+    await _post('drafts/claim-device-drafts', {
+      'deviceId': deviceId,
+    }, token: token);
+  }
+
   Future<GeneratedEmail> generateEmail({
     required String transcript,
     String? tone,
-    required String templateKey,
+    String? customTone,
+    String? template,
+    String? language,
+    String? outputLanguage,
   }) async {
-    final payload = {'transcript': transcript, 'templateKey': templateKey};
-    if (tone != null) payload['tone'] = tone;
+    final payload = {'transcript': transcript};
+    if (tone != null && tone != EmailTone.custom.apiValue) {
+      payload['tone'] = tone;
+    }
+    if (customTone != null && customTone.trim().isNotEmpty) {
+      payload['customTone'] = customTone.trim();
+    }
+    if (template != null) payload['template'] = template;
+    if (language != null) payload['language'] = language;
+    if (outputLanguage != null) payload['outputLanguage'] = outputLanguage;
     final json = await _post('ai/generate-email', payload);
     return GeneratedEmail.fromJson(json);
   }
@@ -412,7 +814,6 @@ class ZApi {
     final response = await request.close();
     final text = await response.transform(utf8.decoder).join();
     _debugLog('SpeechApi upload response status: ${response.statusCode}');
-    _debugLog('SpeechApi raw transcript response: $text');
 
     final decoded = jsonDecode(text) as Map<String, dynamic>;
     if (response.statusCode >= 400) {
@@ -427,11 +828,15 @@ class ZApi {
     _debugLog(
       'SpeechApi final transcript state length: ${transcript.transcript.trim().length}',
     );
+    _debugLog('SpeechApi selected language: ${language.code}');
+    _debugLog('SpeechApi detected language: ${transcript.language}');
+    _debugLog('SpeechApi confidence: ${transcript.confidence}');
     return transcript;
   }
 
   Future<EmailDraft> saveDraft({
-    required String token,
+    String? token,
+    required String deviceId,
     required String subject,
     required String body,
     required String tone,
@@ -439,40 +844,111 @@ class ZApi {
     required String templateKey,
     String? recipient,
   }) async {
-    final json = await _post('drafts', {
-      'recipient': recipient?.trim().isEmpty ?? true ? null : recipient!.trim(),
-      'subject': subject,
-      'body': body,
-      'tone': tone,
-      'transcript': transcript,
-      'templateKey': templateKey,
-    }, token: token);
+    final json = await _post(
+      'drafts',
+      {
+        'recipient': recipient?.trim().isEmpty ?? true
+            ? null
+            : recipient!.trim(),
+        'subject': subject,
+        'body': body,
+        'tone': tone,
+        'transcript': transcript,
+        'templateKey': templateKey,
+      },
+      token: token,
+      deviceId: deviceId,
+    );
     return EmailDraft.fromJson(json);
   }
 
   Future<void> markDraftOpenedInMailApp({
-    required String token,
+    String? token,
+    required String deviceId,
     required String draftId,
   }) async {
-    await _patch('drafts/$draftId/status', {
-      'status': 'opened_in_mail_app',
-    }, token: token);
+    await _patch(
+      'drafts/$draftId/status',
+      {'status': 'opened_in_mail_app'},
+      token: token,
+      deviceId: deviceId,
+    );
+  }
+
+  Future<void> updateDraftStatus({
+    String? token,
+    required String deviceId,
+    required String draftId,
+    required EmailDraftStatus status,
+  }) async {
+    await _patch(
+      'drafts/$draftId/status',
+      {'status': status.apiValue},
+      token: token,
+      deviceId: deviceId,
+    );
+  }
+
+  Future<void> deleteDraft({
+    String? token,
+    required String deviceId,
+    required String draftId,
+  }) async {
+    await _delete('drafts/$draftId', token: token, deviceId: deviceId);
+  }
+
+  Future<EmailDraft> duplicateDraft({
+    String? token,
+    required String deviceId,
+    required String draftId,
+  }) async {
+    final json = await _post(
+      'drafts/$draftId/duplicate',
+      const {},
+      token: token,
+      deviceId: deviceId,
+    );
+    return EmailDraft.fromJson(json);
+  }
+
+  Future<Map<String, dynamic>> _get(
+    String path, {
+    String? token,
+    String? deviceId,
+  }) async {
+    return _sendJson('GET', path, const {}, token: token, deviceId: deviceId);
   }
 
   Future<Map<String, dynamic>> _post(
     String path,
     Map<String, Object?> payload, {
     String? token,
+    String? deviceId,
   }) async {
-    return _sendJson('POST', path, payload, token: token);
+    return _sendJson('POST', path, payload, token: token, deviceId: deviceId);
   }
 
   Future<Map<String, dynamic>> _patch(
     String path,
     Map<String, Object?> payload, {
     String? token,
+    String? deviceId,
   }) async {
-    return _sendJson('PATCH', path, payload, token: token);
+    return _sendJson('PATCH', path, payload, token: token, deviceId: deviceId);
+  }
+
+  Future<Map<String, dynamic>> _delete(
+    String path, {
+    String? token,
+    String? deviceId,
+  }) async {
+    return _sendJson(
+      'DELETE',
+      path,
+      const {},
+      token: token,
+      deviceId: deviceId,
+    );
   }
 
   Future<Map<String, dynamic>> _sendJson(
@@ -480,6 +956,8 @@ class ZApi {
     String path,
     Map<String, Object?> payload, {
     String? token,
+    String? deviceId,
+    bool allowRefresh = true,
   }) async {
     final uri = Uri.parse('${config.apiV1}/$path');
     final client = HttpClient()..connectionTimeout = _connectTimeout;
@@ -491,7 +969,12 @@ class ZApi {
       if (token != null) {
         request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
       }
-      request.write(jsonEncode(payload));
+      if (deviceId != null && deviceId.trim().isNotEmpty) {
+        request.headers.set('X-Device-Id', deviceId.trim());
+      }
+      if (method != 'GET' && method != 'DELETE') {
+        request.write(jsonEncode(payload));
+      }
 
       final response = await request.close().timeout(_sendTimeout);
       final text = await response
@@ -502,11 +985,30 @@ class ZApi {
 
       final decoded = jsonDecode(text) as Map<String, dynamic>;
       if (response.statusCode >= 400) {
+        if (response.statusCode == 401 &&
+            token != null &&
+            allowRefresh &&
+            path != 'auth/refresh' &&
+            await session.refreshFromApi(this)) {
+          return _sendJson(
+            method,
+            path,
+            payload,
+            token: session.accessToken,
+            deviceId: deviceId,
+            allowRefresh: false,
+          );
+        }
         throw ApiException(
           _messageForError(path, response.statusCode, decoded),
+          code: decoded['code'] as String?,
+          email: decoded['email'] as String?,
         );
       }
-      return (decoded['data'] as Map?)?.cast<String, dynamic>() ?? decoded;
+      final data = decoded['data'];
+      if (data is List) return {'items': data};
+      if (data is Map) return data.cast<String, dynamic>();
+      return decoded;
     } on TimeoutException catch (error) {
       _debugLog('Api $method $path timeout/network error: $error');
       throw const ApiException(
@@ -565,9 +1067,11 @@ class ZApi {
 }
 
 class ApiException implements Exception {
-  const ApiException(this.message);
+  const ApiException(this.message, {this.code, this.email});
 
   final String message;
+  final String? code;
+  final String? email;
 
   @override
   String toString() => message;
@@ -589,13 +1093,35 @@ enum VoiceRecordState {
   error,
 }
 
+enum ZAccentColor {
+  blue('blue', 'Blue', Color(0xFF2563EB)),
+  orange('orange', 'Orange', Color(0xFFF97316)),
+  purple('purple', 'Purple', Color(0xFF7C3AED)),
+  green('green', 'Green', Color(0xFF16A34A)),
+  black('black', 'Black', Color(0xFF111827));
+
+  const ZAccentColor(this.code, this.label, this.color);
+
+  final String code;
+  final String label;
+  final Color color;
+
+  static ZAccentColor fromCode(String code) {
+    return values.firstWhere(
+      (accent) => accent.code == code,
+      orElse: () => ZAccentColor.blue,
+    );
+  }
+}
+
 enum EmailTone {
-  professional('professional', 'Professional'),
-  administrative('administrative', 'Administrative'),
-  student('student', 'Student'),
-  friendly('friendly', 'Friendly'),
-  formal('formal', 'Formal'),
-  business('business', 'Business');
+  professional('professional', 'Professionnel'),
+  administrative('administrative', 'Administratif'),
+  student('student', 'Étudiant'),
+  friendly('friendly', 'Amical'),
+  formal('formal', 'Formel'),
+  business('business', 'Business'),
+  custom('custom', 'Autre');
 
   const EmailTone(this.apiValue, this.label);
 
@@ -674,46 +1200,105 @@ enum HistoryFilter {
 }
 
 enum HistorySort {
-  recent('Recent'),
-  oldest('Oldest'),
-  drafts('Drafts'),
-  sent('Sent'),
-  deleted('Deleted');
+  recent('Tous'),
+  oldest('Planifiés'),
+  drafts('Brouillons'),
+  sent('Ouverts dans Mail'),
+  deleted('Supprimés');
 
   const HistorySort(this.label);
 
   final String label;
 }
 
-enum SpeechLanguage {
-  auto('auto', 'Auto detect'),
-  fr('fr', 'Français'),
-  en('en', 'English'),
-  ar('ar', 'العربية'),
-  mixed('fr-en', 'Français + English');
-
-  const SpeechLanguage(this.code, this.label);
+class SpeechLanguage {
+  const SpeechLanguage({
+    required this.code,
+    required this.label,
+    required this.detectedLabel,
+  });
 
   final String code;
   final String label;
+  final String detectedLabel;
+
+  static const auto = SpeechLanguage(
+    code: 'auto',
+    label: 'Auto Detect',
+    detectedLabel: 'Langue non reconnue.',
+  );
+  static const fr = SpeechLanguage(
+    code: 'fr',
+    label: 'Français',
+    detectedLabel: '🇫🇷 Français détecté',
+  );
+  static const en = SpeechLanguage(
+    code: 'en',
+    label: 'English',
+    detectedLabel: '🇬🇧 English detected',
+  );
+  static const ar = SpeechLanguage(
+    code: 'ar',
+    label: 'العربية',
+    detectedLabel: '🇸🇦 العربية مكتشفة',
+  );
+  static const de = SpeechLanguage(
+    code: 'de',
+    label: 'Deutsch',
+    detectedLabel: '🇩🇪 Deutsch erkannt',
+  );
+  static const es = SpeechLanguage(
+    code: 'es',
+    label: 'Español',
+    detectedLabel: '🇪🇸 Español detectado',
+  );
+  static const it = SpeechLanguage(
+    code: 'it',
+    label: 'Italiano',
+    detectedLabel: '🇮🇹 Italiano rilevato',
+  );
+  static const pt = SpeechLanguage(
+    code: 'pt',
+    label: 'Português',
+    detectedLabel: '🇵🇹 Português detectado',
+  );
+  static const nl = SpeechLanguage(
+    code: 'nl',
+    label: 'Nederlands',
+    detectedLabel: '🇳🇱 Nederlands gedetecteerd',
+  );
+  static const tr = SpeechLanguage(
+    code: 'tr',
+    label: 'Türkçe',
+    detectedLabel: '🇹🇷 Türkçe algılandı',
+  );
+
+  static const values = [auto, fr, en, ar, de, es, it, pt, nl, tr];
 
   String get emptyTranscriptMessage {
-    return switch (this) {
-      SpeechLanguage.en || SpeechLanguage.mixed =>
-        'No speech detected. Please try again and speak clearly.',
-      SpeechLanguage.ar => 'لم يتم اكتشاف أي نص. حاول مرة أخرى وتحدث بوضوح.',
-      SpeechLanguage.auto || SpeechLanguage.fr =>
-        'Aucun texte détecté. Réessayez en parlant plus clairement.',
-    };
+    if (this == en) {
+      return 'No speech detected. Please try again and speak clearly.';
+    }
+    if (this == ar) {
+      return 'لم يتم اكتشاف أي نص. حاول مرة أخرى وتحدث بوضوح.';
+    }
+    return 'Aucun texte détecté. Réessayez en parlant plus clairement.';
   }
 
   static SpeechLanguage fromCode(String code) {
-    if (code == 'mixed') return SpeechLanguage.mixed;
+    final normalized = code.trim().toLowerCase().split('-').first;
     return values.firstWhere(
-      (language) => language.code == code,
+      (language) => language.code == normalized,
       orElse: () => SpeechLanguage.auto,
     );
   }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) || other is SpeechLanguage && other.code == code;
+
+  @override
+  int get hashCode => code.hashCode;
 }
 
 class SpeechTranscript {
@@ -721,17 +1306,20 @@ class SpeechTranscript {
     required this.transcript,
     required this.language,
     required this.confidence,
+    required this.duration,
   });
 
   final String transcript;
   final String language;
   final double confidence;
+  final double duration;
 
   factory SpeechTranscript.fromJson(Map<String, dynamic> json) {
     return SpeechTranscript(
       transcript: json['transcript'] as String? ?? '',
       language: json['language'] as String? ?? '',
       confidence: (json['confidence'] as num?)?.toDouble() ?? 0,
+      duration: (json['duration'] as num?)?.toDouble() ?? 0,
     );
   }
 }
@@ -754,18 +1342,46 @@ class UserProfile {
       name: json['name'] as String? ?? 'Utilisateur',
     );
   }
+
+  Map<String, dynamic> toJson() {
+    return {'id': id, 'email': email, 'name': name};
+  }
 }
 
 class AuthResult {
-  const AuthResult({required this.user, required this.accessToken});
+  const AuthResult({
+    required this.user,
+    required this.accessToken,
+    required this.refreshToken,
+  });
 
   final UserProfile user;
   final String accessToken;
+  final String refreshToken;
 
   factory AuthResult.fromJson(Map<String, dynamic> json) {
     return AuthResult(
       user: UserProfile.fromJson((json['user'] as Map).cast<String, dynamic>()),
-      accessToken: json['accessToken'] as String,
+      accessToken: json['accessToken'] as String? ?? '',
+      refreshToken: json['refreshToken'] as String? ?? '',
+    );
+  }
+}
+
+class RegisterResult {
+  const RegisterResult({
+    required this.requiresEmailVerification,
+    required this.email,
+  });
+
+  final bool requiresEmailVerification;
+  final String email;
+
+  factory RegisterResult.fromJson(Map<String, dynamic> json) {
+    return RegisterResult(
+      requiresEmailVerification:
+          json['requiresEmailVerification'] as bool? ?? true,
+      email: json['email'] as String? ?? '',
     );
   }
 }
@@ -833,6 +1449,17 @@ class EmailDraft {
     );
   }
 
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'subject': subject,
+      'body': body,
+      'tone': tone,
+      'status': status.apiValue,
+      'createdAt': createdAt.toIso8601String(),
+    };
+  }
+
   EmailDraft copyWith({
     String? id,
     EmailDraftStatus? status,
@@ -860,38 +1487,59 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    Future<void>.delayed(const Duration(milliseconds: 900), () {
+    Future<void>.delayed(const Duration(milliseconds: 900), () async {
       if (!mounted) return;
       final session = ZScope.of(context).session;
+      while (!session.startupChecked && mounted) {
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+      if (!mounted) return;
       Navigator.of(context).pushReplacementNamed(
-        session.isAuthenticated ? AppRoutes.home : AppRoutes.onboarding,
+        !session.onboardingComplete
+            ? AppRoutes.onboarding
+            : session.isAuthenticated
+            ? AppRoutes.home
+            : AppRoutes.login,
       );
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    return const ZScaffold(
+    final session = ZScope.of(context).session;
+    return ZScaffold(
       child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ZLogo(size: 86),
-            SizedBox(height: 22),
-            Text(
-              'Z',
-              style: TextStyle(
-                fontSize: 42,
-                fontWeight: FontWeight.w700,
-                color: ZTheme.ink,
-              ),
-            ),
-            SizedBox(height: 8),
-            Text(
-              'Parlez. Z rédige.',
-              style: TextStyle(fontSize: 18, color: ZTheme.muted),
-            ),
-          ],
+        child: AnimatedBuilder(
+          animation: session,
+          builder: (context, _) {
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const ZLogo(size: 86),
+                const SizedBox(height: 22),
+                const Text(
+                  'Z',
+                  style: TextStyle(
+                    fontSize: 42,
+                    fontWeight: FontWeight.w700,
+                    color: ZTheme.ink,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Parlez. Z rédige.',
+                  style: TextStyle(fontSize: 18, color: ZTheme.muted),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  session.startupChecking
+                      ? 'Vérification de la session...'
+                      : 'Chargement...',
+                  style: const TextStyle(color: ZTheme.muted),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
@@ -935,14 +1583,19 @@ class OnboardingScreen extends StatelessWidget {
               ),
               const Spacer(),
               FilledButton(
-                onPressed: () =>
-                    Navigator.of(context).pushReplacementNamed(AppRoutes.login),
+                onPressed: () async {
+                  final navigator = Navigator.of(context);
+                  await ZScope.of(context).session.completeOnboarding();
+                  navigator.pushReplacementNamed(AppRoutes.login);
+                },
                 child: const Text('Commencer'),
               ),
               TextButton(
-                onPressed: () => Navigator.of(
-                  context,
-                ).pushReplacementNamed(AppRoutes.register),
+                onPressed: () async {
+                  final navigator = Navigator.of(context);
+                  await ZScope.of(context).session.completeOnboarding();
+                  navigator.pushReplacementNamed(AppRoutes.register);
+                },
                 child: const Text('Créer un compte'),
               ),
             ],
@@ -985,7 +1638,10 @@ class _LoginScreenState extends State<LoginScreen> {
         email: _email.text.trim(),
         password: _password.text,
       );
-      scope.session.authenticate(result);
+      final shouldClaim = scope.session.history.isNotEmpty;
+      await scope.session.authenticate(result, api: scope.api);
+      if (!mounted) return;
+      if (shouldClaim) await _maybeClaimDeviceDrafts(context);
       if (!mounted) return;
       if (kDebugMode) debugPrint('Auth route after login: ${AppRoutes.home}');
       Navigator.of(
@@ -993,6 +1649,13 @@ class _LoginScreenState extends State<LoginScreen> {
       ).pushNamedAndRemoveUntil(AppRoutes.home, (_) => false);
     } catch (error) {
       if (mounted) {
+        if (error is ApiException && error.code == 'EMAIL_NOT_VERIFIED') {
+          Navigator.of(context).pushReplacementNamed(
+            AppRoutes.verifyEmail,
+            arguments: error.email ?? _email.text.trim(),
+          );
+          return;
+        }
         setState(() => _error = _authErrorMessage(error));
       }
     } finally {
@@ -1037,6 +1700,59 @@ String _authErrorMessage(Object error) {
   return message.isEmpty ? 'Erreur inattendue. Réessayez.' : message;
 }
 
+Future<void> _maybeClaimDeviceDrafts(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Associer les brouillons ?'),
+      content: const Text(
+        'Associer les brouillons de cet appareil à votre compte ?',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Plus tard'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Associer'),
+        ),
+      ],
+    ),
+  );
+  if (!context.mounted || !(confirmed ?? false)) return;
+  final scope = ZScope.of(context);
+  try {
+    await scope.session.claimDeviceDrafts(scope.api);
+  } catch (error) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(_authErrorMessage(error))));
+  }
+}
+
+Future<bool> _confirmLogout(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Se déconnecter ?'),
+      content: const Text('Votre session sera supprimée de cet appareil.'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Annuler'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Se déconnecter'),
+        ),
+      ],
+    ),
+  );
+  return confirmed ?? false;
+}
+
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
 
@@ -1048,6 +1764,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final _name = TextEditingController();
   final _email = TextEditingController();
   final _password = TextEditingController();
+  final _confirmPassword = TextEditingController();
   bool _loading = false;
   String? _error;
 
@@ -1056,6 +1773,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
     _name.dispose();
     _email.dispose();
     _password.dispose();
+    _confirmPassword.dispose();
     super.dispose();
   }
 
@@ -1066,20 +1784,20 @@ class _RegisterScreenState extends State<RegisterScreen> {
       _error = null;
     });
     try {
+      if (_password.text != _confirmPassword.text) {
+        throw const ApiException('Les mots de passe ne correspondent pas.');
+      }
       final scope = ZScope.of(context);
       final result = await scope.api.register(
         name: _name.text.trim(),
         email: _email.text.trim(),
         password: _password.text,
       );
-      scope.session.authenticate(result);
       if (!mounted) return;
-      if (kDebugMode) {
-        debugPrint('Auth route after register: ${AppRoutes.home}');
-      }
-      Navigator.of(
-        context,
-      ).pushNamedAndRemoveUntil(AppRoutes.home, (_) => false);
+      Navigator.of(context).pushReplacementNamed(
+        AppRoutes.verifyEmail,
+        arguments: result.email.isEmpty ? _email.text.trim() : result.email,
+      );
     } catch (error) {
       if (mounted) {
         setState(() => _error = _authErrorMessage(error));
@@ -1107,6 +1825,11 @@ class _RegisterScreenState extends State<RegisterScreen> {
           label: 'Mot de passe',
           obscureText: true,
         ),
+        ZTextField(
+          controller: _confirmPassword,
+          label: 'Confirmer le mot de passe',
+          obscureText: true,
+        ),
         FilledButton(
           onPressed: _loading ? null : _submit,
           child: Text(_loading ? 'Création...' : 'Créer mon compte'),
@@ -1121,8 +1844,160 @@ class _RegisterScreenState extends State<RegisterScreen> {
   }
 }
 
-class HomeScreen extends StatelessWidget {
+class VerifyEmailScreen extends StatefulWidget {
+  const VerifyEmailScreen({super.key, required this.email});
+
+  final String email;
+
+  @override
+  State<VerifyEmailScreen> createState() => _VerifyEmailScreenState();
+}
+
+class _VerifyEmailScreenState extends State<VerifyEmailScreen> {
+  final _email = TextEditingController();
+  final _code = TextEditingController();
+  Timer? _timer;
+  int _resendSeconds = 60;
+  bool _verifying = false;
+  bool _resending = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _email.text = widget.email;
+    _code.addListener(() => setState(() {}));
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || _resendSeconds == 0) return;
+      setState(() => _resendSeconds -= 1);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _email.dispose();
+    _code.dispose();
+    super.dispose();
+  }
+
+  Future<void> _verify() async {
+    if (_verifying) return;
+    setState(() {
+      _verifying = true;
+      _error = null;
+    });
+    try {
+      final scope = ZScope.of(context);
+      final shouldClaim = scope.session.history.isNotEmpty;
+      final result = await scope.api.verifyEmail(
+        email: _email.text.trim(),
+        code: _code.text.trim(),
+      );
+      await scope.session.authenticate(result, api: scope.api);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('E-mail vérifié avec succès.')),
+      );
+      if (shouldClaim) await _maybeClaimDeviceDrafts(context);
+      if (!mounted) return;
+      Navigator.of(
+        context,
+      ).pushNamedAndRemoveUntil(AppRoutes.home, (_) => false);
+    } catch (error) {
+      if (mounted) setState(() => _error = _authErrorMessage(error));
+    } finally {
+      if (mounted) setState(() => _verifying = false);
+    }
+  }
+
+  Future<void> _resend() async {
+    if (_resending || _resendSeconds > 0) return;
+    setState(() {
+      _resending = true;
+      _error = null;
+    });
+    try {
+      await ZScope.of(
+        context,
+      ).api.resendVerificationCode(email: _email.text.trim());
+      if (!mounted) return;
+      setState(() => _resendSeconds = 60);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Code renvoyé.')));
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = error is ApiException
+              ? error.message
+              : 'Impossible d’envoyer le code. Réessayez.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _resending = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AuthShell(
+      title: 'Vérifiez votre e-mail',
+      subtitle: 'Entrez le code à 6 chiffres envoyé à votre adresse.',
+      error: _error,
+      children: [
+        ZTextField(
+          controller: _email,
+          label: 'Email',
+          keyboardType: TextInputType.emailAddress,
+        ),
+        TextField(
+          controller: _code,
+          keyboardType: TextInputType.number,
+          maxLength: 6,
+          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+          decoration: const InputDecoration(
+            labelText: 'Code de vérification',
+            counterText: '',
+          ),
+        ),
+        FilledButton(
+          onPressed: _verifying || _code.text.trim().length != 6
+              ? null
+              : _verify,
+          child: Text(_verifying ? 'Vérification...' : 'Vérifier'),
+        ),
+        TextButton(
+          onPressed: _resendSeconds > 0 || _resending ? null : _resend,
+          child: Text(
+            _resendSeconds > 0
+                ? 'Renvoyer dans ${_resendSeconds}s'
+                : _resending
+                ? 'Envoi...'
+                : 'Renvoyer le code',
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final scope = ZScope.of(context);
+      unawaited(scope.session.refreshHistory(scope.api));
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1139,18 +2014,18 @@ class HomeScreen extends StatelessWidget {
                   children: [
                     const ZLogo(size: 46),
                     const SizedBox(width: 12),
-                    const Expanded(
+                    Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Z',
-                            style: TextStyle(
+                            'Bonjour, ${session.user?.name ?? 'Z'}',
+                            style: const TextStyle(
                               fontSize: 28,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-                          Text(
+                          const Text(
                             'Parlez. Z rédige.',
                             style: TextStyle(
                               color: ZTheme.muted,
@@ -1165,8 +2040,27 @@ class HomeScreen extends StatelessWidget {
                           Navigator.of(context).pushNamed(AppRoutes.settings),
                       icon: const Icon(Icons.settings_outlined),
                     ),
+                    IconButton(
+                      onPressed: () =>
+                          Navigator.of(context).pushNamed(AppRoutes.profile),
+                      icon: CircleAvatar(
+                        backgroundColor: ZTheme.accentOf(context),
+                        foregroundColor: Colors.white,
+                        child: Text(_initials(session.user?.name)),
+                      ),
+                    ),
                   ],
                 ),
+                if (session.offlineHistory) ...[
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Hors ligne — données locales affichées',
+                    style: TextStyle(
+                      color: Color(0xFFB45309),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 26),
                 FilledButton.icon(
                   onPressed: () => Navigator.of(context).pushNamed(
@@ -1174,7 +2068,7 @@ class HomeScreen extends StatelessWidget {
                     arguments: const VoiceRecordArgs(autoStart: true),
                   ),
                   icon: const Icon(Icons.mic_rounded),
-                  label: const Text('Créer un e-mail vocal'),
+                  label: const Text('Commencer'),
                 ),
                 const SizedBox(height: 28),
                 Row(
@@ -1230,8 +2124,25 @@ class HomeScreen extends StatelessWidget {
       ),
     );
     if (context.mounted && (confirmed ?? false)) {
-      ZScope.of(context).session.markDraftDeleted(draft.id);
+      final scope = ZScope.of(context);
+      scope.session.markDraftDeleted(draft.id);
+      unawaited(
+        scope.api.deleteDraft(
+          token: scope.session.accessToken,
+          deviceId: scope.session.deviceId,
+          draftId: draft.id,
+        ),
+      );
     }
+  }
+
+  String _initials(String? name) {
+    final parts = (name ?? 'Z').trim().split(RegExp(r'\s+'));
+    return parts
+        .where((part) => part.isNotEmpty)
+        .take(2)
+        .map((part) => part.characters.first.toUpperCase())
+        .join();
   }
 }
 
@@ -1389,7 +2300,9 @@ class _VoiceRecordScreenState extends State<VoiceRecordScreen>
       setState(() => _state = VoiceRecordState.generating);
       final email = await scope.api.generateEmail(
         transcript: scope.session.transcript,
-        templateKey: scope.session.selectedTemplate,
+        template: scope.session.selectedTemplate,
+        language: scope.session.transcriptLanguageForGeneration,
+        outputLanguage: scope.session.outputLanguageForGeneration,
       );
       scope.session.applyGeneratedEmail(email);
       if (!mounted) return;
@@ -1434,13 +2347,13 @@ class _VoiceRecordScreenState extends State<VoiceRecordScreen>
                     shape: BoxShape.circle,
                     color: _state == VoiceRecordState.recording
                         ? const Color(0xFFEF4444)
-                        : ZTheme.blue,
+                        : ZTheme.accentOf(context),
                     boxShadow: [
                       BoxShadow(
                         color:
                             (_state == VoiceRecordState.recording
                                     ? const Color(0xFFEF4444)
-                                    : ZTheme.blue)
+                                    : ZTheme.accentOf(context))
                                 .withValues(alpha: 0.32),
                         blurRadius: 36,
                         offset: const Offset(0, 18),
@@ -1532,10 +2445,10 @@ class _VoiceRecordScreenState extends State<VoiceRecordScreen>
   String get _stateLabel {
     return switch (_state) {
       VoiceRecordState.idle => 'Appuyez pour parler',
-      VoiceRecordState.recording => 'Listening...',
+      VoiceRecordState.recording => 'Enregistrement...',
       VoiceRecordState.transcribing => 'Transcription...',
-      VoiceRecordState.understanding => 'Understanding...',
-      VoiceRecordState.generating => 'Writing your email...',
+      VoiceRecordState.understanding => 'Compréhension...',
+      VoiceRecordState.generating => 'Rédaction...',
       VoiceRecordState.completed => 'Transcription prête',
       VoiceRecordState.empty => 'Aucun texte détecté',
       VoiceRecordState.error => 'Transcription impossible',
@@ -1580,8 +2493,8 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
   late final TextEditingController _recipient;
   late final TextEditingController _subject;
   late final TextEditingController _body;
+  final _customTone = TextEditingController();
   EmailTone _selectedTone = EmailTone.professional;
-  EmailTone _generatedTone = EmailTone.professional;
   bool _initialized = false;
   bool _saving = false;
   bool _openingMail = false;
@@ -1602,7 +2515,6 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
 
     final email = ZScope.of(context).session.generatedEmail;
     _selectedTone = email?.tone ?? EmailTone.professional;
-    _generatedTone = _selectedTone;
     _recipient.text = email?.suggestedRecipient ?? '';
     _subject = TextEditingController(text: email?.subject ?? '');
     _body = TextEditingController(text: email?.body ?? '');
@@ -1613,27 +2525,38 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
     _recipient.dispose();
     _subject.dispose();
     _body.dispose();
+    _customTone.dispose();
     super.dispose();
   }
 
   Future<EmailDraft?> _persistDraft({required bool showSnackBar}) async {
     final scope = ZScope.of(context);
-    if (scope.session.accessToken == null) {
-      if (showSnackBar) {
-        setState(() => _error = 'Connectez-vous pour sauvegarder.');
-      }
-      return null;
-    }
-
-    final draft = await scope.api.saveDraft(
-      token: scope.session.accessToken!,
-      recipient: _recipient.text,
+    final localDraft = EmailDraft(
+      id: 'local-${DateTime.now().microsecondsSinceEpoch}',
       subject: _subject.text,
       body: _body.text,
       tone: scope.session.tone,
-      transcript: scope.session.transcript,
-      templateKey: scope.session.selectedTemplate,
+      status: EmailDraftStatus.draft,
+      createdAt: DateTime.now(),
     );
+
+    EmailDraft draft = localDraft;
+    try {
+      draft = await scope.api.saveDraft(
+        token: scope.session.accessToken,
+        deviceId: scope.session.deviceId,
+        recipient: _recipient.text,
+        subject: _subject.text,
+        body: _body.text,
+        tone: scope.session.tone,
+        transcript: scope.session.transcript,
+        templateKey: scope.session.selectedTemplate,
+      );
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint('Draft saved locally after API failure: $error');
+      }
+    }
     scope.session.addDraft(draft);
     if (mounted && showSnackBar) {
       ScaffoldMessenger.of(
@@ -1667,14 +2590,17 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
       final email = await scope.api.generateEmail(
         transcript: scope.session.transcript,
         tone: _selectedTone.apiValue,
-        templateKey: scope.session.selectedTemplate,
+        customTone: _selectedTone == EmailTone.custom ? _customTone.text : null,
+        template: scope.session.selectedTemplate,
+        language: scope.session.transcriptLanguageForGeneration,
+        outputLanguage: scope.session.outputLanguageForGeneration,
       );
       scope.session.applyGeneratedEmail(email);
-      _generatedTone = email.tone;
-      _selectedTone = email.tone;
+      if (_selectedTone != EmailTone.custom) _selectedTone = email.tone;
       _subject.text = email.subject;
       _body.text = email.body;
-      if (email.suggestedRecipient.trim().isNotEmpty) {
+      if (_recipient.text.trim().isEmpty &&
+          email.suggestedRecipient.trim().isNotEmpty) {
         _recipient.text = email.suggestedRecipient;
       }
     } catch (error) {
@@ -1732,10 +2658,15 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
         return;
       }
 
-      final token = session.accessToken;
-      if (token != null && draft != null && draft.id.isNotEmpty) {
+      if (draft != null && draft.id.startsWith('local-')) {
+        session.updateDraftStatus(draft.id, EmailDraftStatus.openedInMailApp);
+      } else if (draft != null && draft.id.isNotEmpty) {
         try {
-          await api.markDraftOpenedInMailApp(token: token, draftId: draft.id);
+          await api.markDraftOpenedInMailApp(
+            token: session.accessToken,
+            deviceId: session.deviceId,
+            draftId: draft.id,
+          );
           session.updateDraftStatus(draft.id, EmailDraftStatus.openedInMailApp);
         } catch (error) {
           if (kDebugMode) {
@@ -1839,6 +2770,9 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
   Widget build(BuildContext context) {
     final session = ZScope.of(context).session;
     final email = session.generatedEmail;
+    final emailLanguage = email?.language ?? session.emailOutputLanguage.code;
+    final isArabicEmail =
+        SpeechLanguage.fromCode(emailLanguage) == SpeechLanguage.ar;
     return FlowShell(
       title: 'Prévisualisation',
       step: '2/2',
@@ -1850,11 +2784,7 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
             children: [
               InfoPill(
                 icon: Icons.language_rounded,
-                label: _languageLabel(
-                  session.lastDetectedSpeechLanguage != 'unknown'
-                      ? session.lastDetectedSpeechLanguage
-                      : email?.language ?? '',
-                ),
+                label: _languageLabel(session, email?.language ?? ''),
               ),
               InfoPill(
                 icon: Icons.psychology_alt_outlined,
@@ -1872,26 +2802,54 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
                 _selectedTone = tone;
                 ZScope.of(context).session.setTone(tone.apiValue);
               });
+              if (tone != EmailTone.custom) unawaited(_regenerate());
             },
           ),
-          if (_selectedTone != _generatedTone) ...[
+          if (_selectedTone == EmailTone.custom) ...[
+            const SizedBox(height: 10),
+            ZTextField(
+              controller: _customTone,
+              label: 'Décrivez le ton souhaité',
+            ),
             const SizedBox(height: 10),
             FilledButton.icon(
               onPressed: _regenerating ? null : _regenerate,
               icon: const Icon(Icons.auto_fix_high_rounded),
-              label: Text(_regenerating ? 'Régénération...' : 'Régénérer'),
+              label: const Text('Confirmer le ton'),
+            ),
+          ] else if (_regenerating) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: cardDecoration(),
+              child: const Text(
+                'Régénération avec le ton sélectionné...',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
             ),
           ],
           const SizedBox(height: 12),
           ZTextField(controller: _recipient, label: 'Destinataire'),
           const SizedBox(height: 12),
-          ZTextField(controller: _subject, label: 'Objet'),
+          ZTextField(
+            controller: _subject,
+            label: 'Objet',
+            textDirection: isArabicEmail
+                ? TextDirection.rtl
+                : TextDirection.ltr,
+            textAlign: isArabicEmail ? TextAlign.right : TextAlign.start,
+          ),
           const SizedBox(height: 12),
           ZTextField(
             controller: _body,
             label: 'Message',
             minLines: 10,
             maxLines: 16,
+            textDirection: isArabicEmail
+                ? TextDirection.rtl
+                : TextDirection.ltr,
+            textAlign: isArabicEmail ? TextAlign.right : TextAlign.start,
           ),
           if (_error != null) ...[
             const SizedBox(height: 12),
@@ -1942,15 +2900,17 @@ class _EmailPreviewScreenState extends State<EmailPreviewScreen> {
     );
   }
 
-  String _languageLabel(String language) {
-    final normalized = language.toLowerCase();
-    if (normalized.contains('mixed') || normalized.contains('fr-en')) {
-      return 'Language detected: Français / English';
+  String _languageLabel(AppSession session, String emailLanguage) {
+    final outputLanguage = SpeechLanguage.fromCode(emailLanguage);
+    if (outputLanguage != SpeechLanguage.auto) {
+      return 'Email: ${outputLanguage.label}';
     }
-    if (normalized.startsWith('fr')) return 'Language detected: Français';
-    if (normalized.startsWith('en')) return 'Language detected: English';
-    if (normalized.startsWith('ar')) return 'Language detected: العربية';
-    return 'Language detected: Unknown';
+
+    final detected = session.lastDetectedSpeechLanguage.toLowerCase();
+    if (detected == 'unknown' || detected.trim().isEmpty) {
+      return 'Email: Auto';
+    }
+    return 'Email: ${SpeechLanguage.fromCode(detected).label}';
   }
 }
 
@@ -1969,6 +2929,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
   void initState() {
     super.initState();
     _search.addListener(() => setState(() {}));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final scope = ZScope.of(context);
+      unawaited(scope.session.refreshHistory(scope.api));
+    });
   }
 
   @override
@@ -1990,6 +2954,16 @@ class _HistoryScreenState extends State<HistoryScreen> {
           child: ListView(
             children: [
               ZTextField(controller: _search, label: 'Search'),
+              if (session.offlineHistory) ...[
+                const SizedBox(height: 10),
+                const Text(
+                  'Hors ligne — données locales affichées',
+                  style: TextStyle(
+                    color: Color(0xFFB45309),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
               const SizedBox(height: 12),
               Wrap(
                 spacing: 8,
@@ -2029,12 +3003,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
                         ? null
                         : () => _confirmDelete(draft),
                     onRestore: draft.status == EmailDraftStatus.deleted
-                        ? () => session.updateDraftStatus(
-                            draft.id,
-                            EmailDraftStatus.draft,
-                          )
+                        ? () => _updateStatus(draft, EmailDraftStatus.draft)
                         : null,
-                    onDuplicate: () => session.duplicateDraft(draft),
+                    onDuplicate: () => _duplicateDraft(draft),
                     onOpen: () {
                       session.openDraftInPreview(draft);
                       Navigator.of(context).pushNamed(AppRoutes.emailPreview);
@@ -2055,7 +3026,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
           draft.subject.toLowerCase().contains(query) ||
           draft.body.toLowerCase().contains(query);
       final matchesSort = switch (_sort) {
-        HistorySort.recent || HistorySort.oldest => true,
+        HistorySort.recent => true,
+        HistorySort.oldest => draft.status == EmailDraftStatus.scheduled,
         HistorySort.drafts => draft.status == EmailDraftStatus.draft,
         HistorySort.sent => draft.status == EmailDraftStatus.openedInMailApp,
         HistorySort.deleted => draft.status == EmailDraftStatus.deleted,
@@ -2063,11 +3035,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
       return matchesQuery && matchesSort;
     }).toList();
 
-    filtered.sort(
-      (a, b) => _sort == HistorySort.oldest
-          ? a.createdAt.compareTo(b.createdAt)
-          : b.createdAt.compareTo(a.createdAt),
-    );
+    filtered.sort((a, b) => b.createdAt.compareTo(a.createdAt));
     return filtered;
   }
 
@@ -2090,7 +3058,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
       ),
     );
     if (mounted && (confirmed ?? false)) {
-      ZScope.of(context).session.markDraftDeleted(draft.id);
+      await _updateStatus(draft, EmailDraftStatus.deleted);
     }
   }
 
@@ -2115,10 +3083,193 @@ class _HistoryScreenState extends State<HistoryScreen> {
       ),
     );
     if (!mounted || !(confirmed ?? false)) return;
-    final session = ZScope.of(context).session;
     for (final draft in drafts) {
-      session.markDraftDeleted(draft.id);
+      await _updateStatus(draft, EmailDraftStatus.deleted);
     }
+  }
+
+  Future<void> _updateStatus(EmailDraft draft, EmailDraftStatus status) async {
+    final scope = ZScope.of(context);
+    scope.session.updateDraftStatus(draft.id, status);
+    try {
+      await scope.api.updateDraftStatus(
+        token: scope.session.accessToken,
+        deviceId: scope.session.deviceId,
+        draftId: draft.id,
+        status: status,
+      );
+    } catch (_) {
+      scope.session.markOfflineHistory();
+    }
+  }
+
+  Future<void> _duplicateDraft(EmailDraft draft) async {
+    final scope = ZScope.of(context);
+    try {
+      final duplicated = await scope.api.duplicateDraft(
+        token: scope.session.accessToken,
+        deviceId: scope.session.deviceId,
+        draftId: draft.id,
+      );
+      scope.session.addDraft(duplicated);
+    } catch (_) {
+      scope.session.duplicateDraft(draft);
+      scope.session.markOfflineHistory();
+    }
+  }
+}
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  final _name = TextEditingController();
+  bool _saving = false;
+  String? _error;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _name.text = ZScope.of(context).session.user?.name ?? '';
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  Future<void> _saveName() async {
+    if (_saving) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      final scope = ZScope.of(context);
+      final token = scope.session.accessToken;
+      if (token == null) throw const ApiException('Session expirée.');
+      final user = await scope.api.updateMe(token: token, name: _name.text);
+      await scope.session.updateUser(user);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Profil mis à jour')));
+    } catch (error) {
+      if (mounted) setState(() => _error = _authErrorMessage(error));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _logout() async {
+    final confirmed = await _confirmLogout(context);
+    if (!mounted || !confirmed) return;
+    final scope = ZScope.of(context);
+    await scope.session.logout(scope.api);
+    if (!mounted) return;
+    Navigator.of(
+      context,
+    ).pushNamedAndRemoveUntil(AppRoutes.login, (_) => false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = ZScope.of(context).session;
+    final user = session.user;
+    return FlowShell(
+      title: 'Profil',
+      step: '',
+      child: ListView(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: cardDecoration(),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                CircleAvatar(
+                  radius: 34,
+                  backgroundColor: ZTheme.accentOf(context),
+                  foregroundColor: Colors.white,
+                  child: Text(
+                    _initials(user?.name),
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  user?.name ?? 'Utilisateur',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                Text(
+                  user?.email ?? '',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: ZTheme.muted),
+                ),
+                const SizedBox(height: 18),
+                ZTextField(controller: _name, label: 'Nom'),
+                const SizedBox(height: 10),
+                FilledButton.icon(
+                  onPressed: _saving ? null : _saveName,
+                  icon: const Icon(Icons.save_outlined),
+                  label: Text(_saving ? 'Sauvegarde...' : 'Enregistrer'),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    _error!,
+                    style: const TextStyle(
+                      color: Color(0xFFDC2626),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: () =>
+                Navigator.of(context).pushNamed(AppRoutes.settings),
+            icon: const Icon(Icons.settings_outlined),
+            label: const Text('Préférences'),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: () => Navigator.of(context).pushNamed(AppRoutes.history),
+            icon: const Icon(Icons.history_rounded),
+            label: const Text('Mes Emails'),
+          ),
+          const SizedBox(height: 18),
+          OutlinedButton.icon(
+            onPressed: _logout,
+            icon: const Icon(Icons.logout_rounded),
+            label: const Text('Se déconnecter'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _initials(String? name) {
+    final parts = (name ?? 'Z').trim().split(RegExp(r'\s+'));
+    return parts
+        .where((part) => part.isNotEmpty)
+        .take(2)
+        .map((part) => part.characters.first.toUpperCase())
+        .join();
   }
 }
 
@@ -2141,17 +3292,50 @@ class SettingsScreen extends StatelessWidget {
                 decoration: cardDecoration(),
                 child: Row(
                   children: [
-                    const CircleAvatar(
-                      radius: 26,
-                      backgroundColor: ZTheme.blue,
-                      child: Text('Z'),
+                    CircleAvatar(
+                      backgroundColor: ZTheme.accentOf(context),
+                      foregroundColor: Colors.white,
+                      child: Text(_initials(session.user?.name)),
                     ),
-                    const SizedBox(width: 14),
+                    const SizedBox(width: 12),
                     Expanded(
-                      child: Text(
-                        session.user?.email ?? 'Non connecté',
-                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            session.user?.name ?? 'Utilisateur',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 16,
+                            ),
+                          ),
+                          Text(
+                            session.user?.email ?? '',
+                            style: const TextStyle(color: ZTheme.muted),
+                          ),
+                        ],
                       ),
+                    ),
+                    IconButton(
+                      tooltip: 'Profil',
+                      onPressed: () =>
+                          Navigator.of(context).pushNamed(AppRoutes.profile),
+                      icon: const Icon(Icons.person_outline_rounded),
+                    ),
+                    IconButton(
+                      tooltip: 'Déconnexion',
+                      onPressed: () async {
+                        final confirmed = await _confirmLogout(context);
+                        if (!context.mounted || !confirmed) return;
+                        final scope = ZScope.of(context);
+                        await scope.session.logout(scope.api);
+                        if (!context.mounted) return;
+                        Navigator.of(context).pushNamedAndRemoveUntil(
+                          AppRoutes.login,
+                          (_) => false,
+                        );
+                      },
+                      icon: const Icon(Icons.logout_rounded),
                     ),
                   ],
                 ),
@@ -2164,16 +3348,120 @@ class SettingsScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      'Langue avancée',
+                      'Apparence',
                       style: TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.w600,
                       ),
                     ),
                     const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final mode in ThemeMode.values)
+                          ChoiceChip(
+                            label: Text(_themeModeLabel(mode)),
+                            selected: session.themeMode == mode,
+                            onSelected: (_) => session.setThemeMode(mode),
+                            selectedColor: ZTheme.accentOf(
+                              context,
+                            ).withValues(alpha: 0.14),
+                            backgroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(18),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Couleur accent',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        for (final accent in ZAccentColor.values)
+                          ChoiceChip(
+                            avatar: CircleAvatar(
+                              radius: 8,
+                              backgroundColor: accent.color,
+                            ),
+                            label: Text(accent.label),
+                            selected: session.accentColor == accent,
+                            onSelected: (_) => session.setAccentColor(accent),
+                            selectedColor: accent.color.withValues(alpha: 0.14),
+                            backgroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(18),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: cardDecoration(),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Speech language',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Language spoken in the recording',
+                      style: TextStyle(
+                        color: ZTheme.muted,
+                        fontSize: 13,
+                        height: 1.35,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
                     LanguageSelector(
                       selected: session.transcriptionLanguage,
                       onChanged: session.setTranscriptionLanguage,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: cardDecoration(),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Email language',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Language of the generated email',
+                      style: TextStyle(
+                        color: ZTheme.muted,
+                        fontSize: 13,
+                        height: 1.35,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    LanguageSelector(
+                      selected: session.emailOutputLanguage,
+                      onChanged: session.setEmailOutputLanguage,
                     ),
                   ],
                 ),
@@ -2197,11 +3485,12 @@ class SettingsScreen extends StatelessWidget {
                       future: const MailLauncherService()
                           .detectAvailableProviderCodes(),
                       builder: (context, snapshot) {
-                        final detected =
-                            snapshot.data ?? {'system', 'copy_only'};
+                        final detected = snapshot.data;
                         final apps = PreferredMailApp.values.where((app) {
-                          if (app == PreferredMailApp.protonMail) return false;
-                          return detected.contains(app.code);
+                          if (app == PreferredMailApp.appleMail) return false;
+                          return detected == null ||
+                              detected.contains(app.code) ||
+                              app == PreferredMailApp.protonMail;
                         });
                         return Wrap(
                           spacing: 8,
@@ -2213,9 +3502,9 @@ class SettingsScreen extends StatelessWidget {
                                 selected: session.preferredMailApp == app,
                                 onSelected: (_) =>
                                     session.setPreferredMailApp(app),
-                                selectedColor: ZTheme.blue.withValues(
-                                  alpha: 0.12,
-                                ),
+                                selectedColor: ZTheme.accentOf(
+                                  context,
+                                ).withValues(alpha: 0.12),
                                 backgroundColor: Colors.white,
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(18),
@@ -2261,21 +3550,28 @@ class SettingsScreen extends StatelessWidget {
                   ],
                 ),
               ),
-              const SizedBox(height: 24),
-              OutlinedButton(
-                onPressed: () {
-                  session.logout();
-                  Navigator.of(
-                    context,
-                  ).pushNamedAndRemoveUntil(AppRoutes.login, (_) => false);
-                },
-                child: const Text('Se déconnecter'),
-              ),
             ],
           ),
         );
       },
     );
+  }
+
+  String _themeModeLabel(ThemeMode mode) {
+    return switch (mode) {
+      ThemeMode.system => 'System',
+      ThemeMode.light => 'Light',
+      ThemeMode.dark => 'Dark',
+    };
+  }
+
+  String _initials(String? name) {
+    final parts = (name ?? 'Z').trim().split(RegExp(r'\s+'));
+    return parts
+        .where((part) => part.isNotEmpty)
+        .take(2)
+        .map((part) => part.characters.first.toUpperCase())
+        .join();
   }
 }
 
@@ -2303,10 +3599,12 @@ class LanguageSelector extends StatelessWidget {
             label: Text(language.label),
             selected: selected == language,
             onSelected: enabled ? (_) => onChanged(language) : null,
-            selectedColor: ZTheme.blue.withValues(alpha: 0.12),
+            selectedColor: ZTheme.accentOf(context).withValues(alpha: 0.12),
             backgroundColor: ZTheme.card,
             labelStyle: TextStyle(
-              color: selected == language ? ZTheme.blue : ZTheme.ink,
+              color: selected == language
+                  ? ZTheme.accentOf(context)
+                  : ZTheme.ink,
               fontWeight: FontWeight.w500,
             ),
             shape: RoundedRectangleBorder(
@@ -2441,7 +3739,7 @@ class ZScaffold extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(backgroundColor: ZTheme.canvas, body: child);
+    return Scaffold(body: child);
   }
 }
 
@@ -2470,6 +3768,8 @@ class ZTextField extends StatelessWidget {
     this.keyboardType,
     this.minLines = 1,
     this.maxLines = 1,
+    this.textDirection,
+    this.textAlign = TextAlign.start,
   });
 
   final TextEditingController controller;
@@ -2478,6 +3778,8 @@ class ZTextField extends StatelessWidget {
   final TextInputType? keyboardType;
   final int minLines;
   final int maxLines;
+  final TextDirection? textDirection;
+  final TextAlign textAlign;
 
   @override
   Widget build(BuildContext context) {
@@ -2487,6 +3789,8 @@ class ZTextField extends StatelessWidget {
       keyboardType: keyboardType,
       minLines: minLines,
       maxLines: obscureText ? 1 : maxLines,
+      textDirection: textDirection,
+      textAlign: textAlign,
       decoration: InputDecoration(labelText: label),
     );
   }

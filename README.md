@@ -59,6 +59,25 @@ If `API_BASE_URL` is omitted, development builds fall back automatically:
 - iOS Simulator: `http://localhost:3000`
 - Physical devices: `API_LAN_IP=<MAC_LOCAL_IP>`
 
+## Speech Languages
+
+Settings -> Speech supports:
+
+- Auto Detect
+- French
+- English
+- Arabic
+- German
+- Spanish
+- Italian
+- Portuguese
+- Dutch
+- Turkish
+
+The app sends the selected value as the multipart `language` field to
+`POST /speech/transcribe`. Auto Detect sends `language=auto`; manual choices
+send `fr`, `en`, `ar`, `de`, `es`, `it`, `pt`, `nl`, or `tr`.
+
 Login and register requests have a 10 second connection timeout and 20 second
 send/receive timeouts. If the backend is unreachable, the app shows:
 
