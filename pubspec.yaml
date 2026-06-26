@@ -10,7 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  url_launcher: ^6.3.1
+  socket_io_client: ^3.1.2
   record: ^7.1.0
   path_provider: ^2.1.6
   shared_preferences: ^2.3.5
